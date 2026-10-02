@@ -1,5 +1,10 @@
+import os
 import sqlite3
 from traceback import print_exc
+
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 DB_PATH = "./data/vinted_notifications.db"
 
@@ -28,15 +33,68 @@ def create_or_update_sqlite_db(db_path):
             conn.close()
 
 
-def is_item_in_db_by_id(id):
+def run_migrations(migrations_dir="./migrations"):
+    """
+    Apply every migration after the current version, in chain order.
+
+    Files are named <from>_<to>.sql; matching on "<version>_" rather than the bare
+    version keeps 1.0.5 from also matching 1.0.5.1_*, 1.0.5.4_* and so on.
+    """
+    migration_files = os.listdir(migrations_dir)
+    current_version = get_parameter("version")
+    while True:
+        migration_file = next(
+            (f for f in migration_files if f.startswith(current_version + "_")), None
+        )
+        if not migration_file:
+            break
+        logger.info(f"Running migration: {migration_file}")
+        create_or_update_sqlite_db(os.path.join(migrations_dir, migration_file))
+        current_version = get_parameter("version")
+
+
+def get_tracked_item(item_id, query_id):
+    """The last seen {"price", "in_range"} of an item for a query, or None."""
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT() FROM items WHERE item=?", (id,))
-        if cursor.fetchone()[0]:
-            return True
-        return False
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT price, in_range FROM items WHERE item=? AND query_id=?",
+            (item_id, query_id),
+        ).fetchone()
+        return None if row is None else {"price": float(row[0]), "in_range": bool(row[1])}
+    except Exception:
+        print_exc()
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_tracked_item(
+    id, title, query_id, price, timestamp, photo_url, currency, in_range
+):
+    """
+    Record an item for a query, or refresh its price if the query has seen it before.
+
+    The first-seen timestamp is kept on updates; it is the closest thing to a
+    listing time the API still provides.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO items (item, title, price, currency, timestamp, photo_url, query_id, in_range) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (item, query_id) DO UPDATE SET "
+            "title=excluded.title, price=excluded.price, currency=excluded.currency, "
+            "photo_url=excluded.photo_url, in_range=excluded.in_range",
+            (id, title, price, currency, timestamp, photo_url, query_id, int(in_range)),
+        )
+        conn.execute(
+            "UPDATE queries SET last_item=? WHERE id=? AND last_item IS NULL",
+            (timestamp, query_id),
+        )
+        conn.commit()
     except Exception:
         print_exc()
     finally:
@@ -57,44 +115,6 @@ def get_last_timestamp(query_id):
     except Exception:
         print_exc()
         return None
-    finally:
-        if conn:
-            conn.close()
-
-
-def update_last_timestamp(query_id, timestamp):
-    conn = None
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE queries SET last_item=? WHERE id=?", (timestamp, query_id)
-        )
-        conn.commit()
-    except Exception:
-        print_exc()
-    finally:
-        if conn:
-            conn.close()
-
-
-def add_item_to_db(id, title, query_id, price, timestamp, photo_url, currency="EUR"):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # Insert into db the id and the query_id related to the item
-        cursor.execute(
-            "INSERT INTO items (item, title, price, currency, timestamp, photo_url, query_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (id, title, price, currency, timestamp, photo_url, query_id),
-        )
-        # Update the last item for the query
-        cursor.execute(
-            "UPDATE queries SET last_item=? WHERE id=?", (timestamp, query_id)
-        )
-        conn.commit()
-    except Exception:
-        print_exc()
     finally:
         if conn:
             conn.close()

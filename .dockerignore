@@ -43,4 +43,6 @@ docker-compose.yml
 .idea/
 .vscode/
 *.swp
-*.swo
+*.swotests/
+.venv/
+.pytest_cache/

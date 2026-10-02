@@ -1,5 +1,6 @@
 import db
 import requests
+import tracking
 from pyVintedVN import Vinted, requester
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from logger import get_logger
@@ -284,6 +285,11 @@ def process_items(queue):
     Process all queries from the database, search for items, and put them in the queue.
     Uses the global items_queue by default, but can accept a custom queue for backward compatibility.
 
+    The price filter is left out of the API call: with one applied, Vinted pads an
+    empty search with unrelated listings, and the price of a listing outside the
+    range is exactly what is needed to notice it dropping into range later. Both
+    the title match and the price range are enforced locally instead.
+
     Args:
         queue (Queue, optional): The queue to put the items in. Defaults to the global items_queue.
 
@@ -301,27 +307,34 @@ def process_items(queue):
 
     # for each keyword we parse data
     for query in all_queries:
-        all_items = vinted.items.search(query[1], nbr_items=items_per_query)
-        # Filter to only include new items. This should reduce the amount of db calls.
-        data = [item for item in all_items if item.is_new_item()]
-        queue.put((data, query[0]))
-        logger.info(f"Scraped {len(data)} items for query: {query[1]}")
+        url = query[1]
+        all_items = vinted.items.search(
+            tracking.strip_price_params(url), nbr_items=items_per_query
+        )
+        text = tracking.search_text(url)
+        data = [item for item in all_items if tracking.title_matches(text, item.title)]
+        queue.put((data, query[0], tracking.price_range(url)))
+        logger.info(
+            f"Scraped {len(all_items)} items, {len(data)} matching the title, for query: {url}"
+        )
 
 
 def clear_item_queue(items_queue, new_items_queue):
     """
     Process items from the items_queue.
     This function is scheduled to run frequently.
+
+    Every matching item is recorded per query with its current price. An item is
+    announced when it is first seen inside the query's price range, or when a
+    price change moves an already known item into it.
     """
     if not items_queue.empty():
-        data, query_id = items_queue.get()
+        data, query_id, (price_from, price_to) = items_queue.get()
         banwords_str = db.get_parameter("banwords")
 
-        # Read the watermark once, before the loop. It doubles as the "has this query
-        # ever produced anything?" flag, and the updates made below would otherwise
-        # cut a first-run priming pass short right after the first item.
-        last_query_timestamp = db.get_last_timestamp(query_id)
-        is_first_run = last_query_timestamp is None
+        # Read this once, before the loop: saving the first item below marks the
+        # query as having run, which would cut a first-run priming pass short.
+        is_first_run = db.get_last_timestamp(query_id) is None
         if is_first_run:
             logger.info(
                 f"First run for query {query_id}: recording {len(data)} item(s) "
@@ -330,47 +343,39 @@ def clear_item_queue(items_queue, new_items_queue):
 
         to_notify = []
         for item in reversed(data):
-
-            # The watermark is only meaningful when the API actually supplied a
-            # listing time. Otherwise raw_timestamp is merely when we saw the item,
-            # and comparing it against the watermark would discard every new item.
-            if (
-                item.has_real_timestamp
-                and last_query_timestamp is not None
-                and last_query_timestamp >= item.raw_timestamp
-            ):
-                continue
-            # In case of multiple queries, we need to check if the item is already in the db
-            if db.is_item_in_db_by_id(item.id) is True:
-                # We update the timestamp
-                db.update_last_timestamp(query_id, item.raw_timestamp)
-                continue
-            # If there's an allowlist and
-            # If the user's country is not in the allowlist, we just update the timestamp
-            if db.get_allowlist() != 0 and (
-                get_user_country(item.raw_data["user"]["id"])
-            ) not in (db.get_allowlist() + ["XX"]):
-                db.update_last_timestamp(query_id, item.raw_timestamp)
-                continue
             # Check if the item title contains any banwords
             if banwords_str and contains_banwords(item.title, banwords_str):
-                # If it contains banwords, just update the timestamp and skip
-                db.update_last_timestamp(query_id, item.raw_timestamp)
                 continue
 
-            # Being recorded is what stops an item coming back next run, so every
-            # item that reaches this point is written to the db whether or not it
-            # ends up being announced.
-            to_notify.append(item)
-            db.add_item_to_db(
-                id=item.id,
-                timestamp=item.raw_timestamp,
-                price=item.price,
-                title=item.title,
-                photo_url=item.photo,
-                query_id=query_id,
-                currency=item.currency,
+            previous = db.get_tracked_item(item.id, query_id)
+            reason, now_in_range = tracking.decide(
+                previous, item.price, price_from, price_to
             )
+
+            # Only look the seller up for items we would otherwise announce: it
+            # costs a request per item.
+            allowlist = db.get_allowlist()
+            if (
+                reason
+                and allowlist != 0
+                and get_user_country(item.raw_data["user"]["id"]) not in allowlist + ["XX"]
+            ):
+                reason = None
+
+            # Recording the price is what lets a later drop into range be noticed,
+            # so every item is saved whether or not it ends up being announced.
+            db.save_tracked_item(
+                id=item.id,
+                title=item.title,
+                query_id=query_id,
+                price=item.price,
+                timestamp=item.raw_timestamp,
+                photo_url=item.photo,
+                currency=item.currency,
+                in_range=now_in_range,
+            )
+            if reason:
+                to_notify.append((item, reason, previous))
 
         if is_first_run:
             return
@@ -380,20 +385,25 @@ def clear_item_queue(items_queue, new_items_queue):
         # listings that just appeared are not.
         if len(to_notify) > MAX_NOTIFICATIONS_PER_RUN:
             logger.warning(
-                f"{len(to_notify)} unseen items for query {query_id}; notifying the "
+                f"{len(to_notify)} items to announce for query {query_id}; notifying the "
                 f"{MAX_NOTIFICATIONS_PER_RUN} most recent and recording the rest silently."
             )
             to_notify = to_notify[-MAX_NOTIFICATIONS_PER_RUN:]
 
-        for item in to_notify:
+        message_template = db.get_parameter("message_template")
+        for item, reason, previous in to_notify:
             # We create the message
-            message_template = db.get_parameter("message_template")
             content = message_template.format(
                 title=item.title,
                 price=str(item.price) + " " + item.currency,
                 brand=item.brand_title,
                 image=None if item.photo is None else item.photo,
             )
+            if reason == "drop":
+                content = (
+                    f"📉 {previous['price']:.2f} → {float(item.price):.2f} {item.currency}\n"
+                    + content
+                )
             # add the item to the queue
             new_items_queue.put((content, item.url, "Open Vinted", None, None))
             # new_items_queue.put((content, item.url, "Open Vinted", item.buy_url, "Open buy page"))
